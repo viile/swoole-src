@@ -24,7 +24,6 @@
 enum swAioMode
 {
     SW_AIO_BASE = 0,
-    SW_AIO_GCC,
     SW_AIO_LINUX,
 };
 
@@ -38,17 +37,17 @@ enum
 typedef struct _swAio_event
 {
     int fd;
-
-    /**
-     * write or read
-     */
+    int task_id;
     uint8_t type;
+    uint16_t flags;
     off_t offset;
     size_t nbytes;
     void *buf;
     void *req;
     int ret;
     int error;
+    void *object;
+    void (*callback)(struct _swAio_event *event);
 } swAio_event;
 
 typedef struct
@@ -57,6 +56,8 @@ typedef struct
     uint8_t mode;
     uint8_t thread_num;
     uint32_t task_num;
+    uint16_t current_id;
+    swLock lock;
 
     void (*destroy)(void);
     void (*callback)(swAio_event *aio_event);
@@ -69,14 +70,17 @@ extern swPipe swoole_aio_pipe;
 
 void swAio_callback_test(swAio_event *aio_event);
 int swAio_init(void);
+void swAio_free(void);
 int swAioBase_init(int max_aio_events);
 int swAio_dns_lookup(void *hostname, void *ip_addr, size_t size);
+int swAio_dispatch(swAio_event *_event);
 
 #ifdef HAVE_GCC_AIO
 int swAioGcc_init(int max_aio_events);
 #endif
 
 #ifdef HAVE_LINUX_AIO
+#define SW_AIO_MIN_UNIT_SIZE     512
 int swAioLinux_init(int max_aio_events);
 #endif
 

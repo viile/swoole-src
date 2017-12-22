@@ -101,11 +101,6 @@ static void swReactorKqueue_free(swReactor *reactor)
 
 static int swReactorKqueue_add(swReactor *reactor, int fd, int fdtype)
 {
-    if (swReactor_add(reactor, fd, fdtype) < 0)
-    {
-        return SW_ERR;
-    }
-
     swReactorKqueue *this = reactor->object;
     struct kevent e;
     swFd fd_;
@@ -115,6 +110,8 @@ static int swReactorKqueue_add(swReactor *reactor, int fd, int fdtype)
     int fflags = 0;
     fd_.fd = fd;
     fd_.fdtype = swReactor_fdtype(fdtype);
+
+    swReactor_add(reactor, fd, fdtype);
 
     if (swReactor_event_read(fdtype))
     {
@@ -127,6 +124,7 @@ static int swReactorKqueue_add(swReactor *reactor, int fd, int fdtype)
         if (ret < 0)
         {
             swSysError("add events[fd=%d#%d, type=%d, events=read] failed.", fd, reactor->id, fd_.fdtype);
+            swReactor_del(reactor, fd);
             return SW_ERR;
         }
     }
@@ -139,12 +137,12 @@ static int swReactorKqueue_add(swReactor *reactor, int fd, int fdtype)
         if (ret < 0)
         {
             swSysError("add events[fd=%d#%d, type=%d, events=write] failed.", fd, reactor->id, fd_.fdtype);
+            swReactor_del(reactor, fd);
             return SW_ERR;
         }
     }
 
-    memcpy(&e.udata, &fd_, sizeof(swFd));
-    swTrace("[THREAD #%ld]EP=%d|FD=%d\n", pthread_self(), this->epfd, fd);
+    swTrace("[THREAD #%d]EP=%d|FD=%d, events=%d", SwooleTG.id, this->epfd, fd, fdtype);
     reactor->event_num++;
     return SW_OK;
 }
@@ -209,6 +207,7 @@ static int swReactorKqueue_set(swReactor *reactor, int fd, int fdtype)
             return SW_ERR;
         }
     }
+    swTrace("[THREAD #%d]EP=%d|FD=%d, events=%d", SwooleTG.id, this->epfd, fd, fdtype);
     //execute parent method
     swReactor_set(reactor, fd, fdtype);
     return SW_OK;
@@ -244,11 +243,9 @@ static int swReactorKqueue_del(swReactor *reactor, int fd)
         }
     }
 
-    if (swReactor_del(reactor, fd) < 0)
-    {
-        return SW_ERR;
-    }
+    swTrace("[THREAD #%d]EP=%d|FD=%d", SwooleTG.id, this->epfd, fd);
     reactor->event_num = reactor->event_num <= 0 ? 0 : reactor->event_num - 1;
+    swReactor_del(reactor, fd);
     return SW_OK;
 }
 
@@ -276,6 +273,8 @@ static int swReactorKqueue_wait(swReactor *reactor, struct timeval *timeo)
         }
     }
 
+    reactor->start = 1;
+
     while (reactor->running > 0)
     {
         if (reactor->timeout_msec > 0)
@@ -292,7 +291,7 @@ static int swReactorKqueue_wait(swReactor *reactor, struct timeval *timeo)
         n = kevent(object->epfd, NULL, 0, object->events, object->event_max, t_ptr);
         if (n < 0)
         {
-            //swTrace("kqueue error.EP=%d | Errno=%d\n", object->epfd, errno);
+            swTrace("kqueue error.EP=%d | Errno=%d\n", object->epfd, errno);
             if (swReactor_error(reactor) < 0)
             {
                 swWarn("Kqueue[#%d] Error: %s[%d]", reactor->id, strerror(errno), errno);
@@ -314,6 +313,7 @@ static int swReactorKqueue_wait(swReactor *reactor, struct timeval *timeo)
 
         for (i = 0; i < n; i++)
         {
+            swTrace("n %d events.", n);
             if (object->events[i].udata)
             {
                 memcpy(&fd_, &(object->events[i].udata), sizeof(fd_));
@@ -325,6 +325,10 @@ static int swReactorKqueue_wait(swReactor *reactor, struct timeval *timeo)
                 //read
                 if (object->events[i].filter == EVFILT_READ)
                 {
+                    if (event.socket->removed)
+                    {
+                        continue;
+                    }
                     handle = swReactor_getHandle(reactor, SW_EVENT_READ, event.type);
                     ret = handle(reactor, &event);
                     if (ret < 0)
@@ -333,8 +337,12 @@ static int swReactorKqueue_wait(swReactor *reactor, struct timeval *timeo)
                     }
                 }
                 //write
-                else if (object->events[i].filter == EVFILT_WRITE && event.socket->fd && !event.socket->removed)
+                else if (object->events[i].filter == EVFILT_WRITE)
                 {
+                    if (event.socket->removed)
+                    {
+                        continue;
+                    }
                     handle = swReactor_getHandle(reactor, SW_EVENT_WRITE, event.type);
                     ret = handle(reactor, &event);
                     if (ret < 0)
@@ -344,7 +352,7 @@ static int swReactorKqueue_wait(swReactor *reactor, struct timeval *timeo)
                 }
                 else
                 {
-                    swWarn("kqueue event unknow filter=%d", object->events[i].filter);
+                    swWarn("unknown event filter[%d].", object->events[i].filter);
                 }
             }
         }

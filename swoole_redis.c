@@ -27,29 +27,67 @@ typedef struct
 {
     redisAsyncContext *context;
     uint8_t state;
-    zval *result_callback;
-    zval _result_callback;
-    zval *connect_callback;
-    zval _connect_callback;
+    uint8_t connected;
+    uint8_t subscribe;
+    uint8_t connecting;
+    uint32_t reqnum;
+
     zval *object;
+    zval *message_callback;
+
+    double timeout;
+    swTimer_node *timer;
+
+    char *password;
+    uint8_t password_len;
+    int8_t database;
+    uint8_t failure;
+    uint8_t wait_count;
+
+#if PHP_MAJOR_VERSION >= 7
+    zval _message_callback;
     zval _object;
+#endif
+
 } swRedisClient;
 
 enum swoole_redis_state
 {
     SWOOLE_REDIS_STATE_CONNECT,
     SWOOLE_REDIS_STATE_READY,
-    SWOOLE_REDIS_STATE_WAIT,
+    SWOOLE_REDIS_STATE_WAIT_RESULT,
+    SWOOLE_REDIS_STATE_SUBSCRIBE,
     SWOOLE_REDIS_STATE_CLOSED,
 };
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_redis_construct, 0, 0, 0)
+    ZEND_ARG_ARRAY_INFO(0, setting, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_redis_connect, 0, 0, 3)
+    ZEND_ARG_INFO(0, host)
+    ZEND_ARG_INFO(0, port)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_redis_call, 0, 0, 2)
     ZEND_ARG_INFO(0, command)
     ZEND_ARG_INFO(0, params)
 ZEND_END_ARG_INFO()
 
-static PHP_METHOD(swoole_redis, connect);
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_redis_on, 0, 0, 2)
+    ZEND_ARG_INFO(0, event_name)
+    ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_void, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+static PHP_METHOD(swoole_redis, __construct);
 static PHP_METHOD(swoole_redis, __destruct);
+static PHP_METHOD(swoole_redis, on);
+static PHP_METHOD(swoole_redis, connect);
+static PHP_METHOD(swoole_redis, getState);
 static PHP_METHOD(swoole_redis, __call);
 static PHP_METHOD(swoole_redis, close);
 
@@ -57,8 +95,11 @@ static void swoole_redis_onConnect(const redisAsyncContext *c, int status);
 static void swoole_redis_onClose(const redisAsyncContext *c, int status);
 static int swoole_redis_onRead(swReactor *reactor, swEvent *event);
 static int swoole_redis_onWrite(swReactor *reactor, swEvent *event);
+static int swoole_redis_onError(swReactor *reactor, swEvent *event);
 static void swoole_redis_onResult(redisAsyncContext *c, void *r, void *privdata);
 static void swoole_redis_parse_result(swRedisClient *redis, zval* return_value, redisReply* reply TSRMLS_DC);
+static void swoole_redis_onCompleted(redisAsyncContext *c, void *r, void *privdata);
+static void swoole_redis_onTimeout(swTimer *timer, swTimer_node *tnode);
 
 static void swoole_redis_event_AddRead(void *privdata);
 static void swoole_redis_event_AddWrite(void *privdata);
@@ -67,22 +108,200 @@ static void swoole_redis_event_DelWrite(void *privdata);
 static void swoole_redis_event_Cleanup(void *privdata);
 
 static zend_class_entry swoole_redis_ce;
-zend_class_entry *swoole_redis_class_entry_ptr;
-static int isset_event_callback = 0;
+static zend_class_entry *swoole_redis_class_entry_ptr;
 
 static const zend_function_entry swoole_redis_methods[] =
 {
-    PHP_ME(swoole_redis, connect, NULL, ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_redis, close, NULL, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_redis, __construct, arginfo_swoole_redis_construct, ZEND_ACC_PUBLIC | ZEND_ACC_CTOR)
+    PHP_ME(swoole_redis, __destruct, arginfo_swoole_void, ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
+    PHP_ME(swoole_redis, on, arginfo_swoole_redis_on, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_redis, connect, arginfo_swoole_redis_connect, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_redis, close, arginfo_swoole_void, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_redis, getState, arginfo_swoole_void, ZEND_ACC_PUBLIC)
     PHP_ME(swoole_redis, __call, arginfo_swoole_redis_call, ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_redis, __destruct, NULL, ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
     PHP_FE_END
 };
 
+static sw_inline int swoole_redis_is_message_command(char *command, int command_len)
+{
+    if (strncasecmp("subscribe", command, command_len) == 0)
+    {
+        return SW_TRUE;
+    }
+    else if (strncasecmp("psubscribe", command, command_len) == 0)
+    {
+        return SW_TRUE;
+    }
+    else if (strncasecmp("unsubscribe", command, command_len) == 0)
+    {
+        return SW_TRUE;
+    }
+    else if (strncasecmp("punsubscribe", command, command_len) == 0)
+    {
+        return SW_TRUE;
+    }
+    else
+    {
+        return SW_FALSE;
+    }
+}
+
+static sw_inline void redis_execute_connect_callback(swRedisClient *redis, int success TSRMLS_DC)
+{
+    zval *result, *retval;
+    SW_MAKE_STD_ZVAL(result);
+    ZVAL_BOOL(result, success);
+
+    zval **args[2];
+    zval *zcallback = sw_zend_read_property(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("onConnect"), 0 TSRMLS_CC);
+    args[0] = &redis->object;
+    args[1] = &result;
+    redis->connecting = 1;
+    if (sw_call_user_function_ex(EG(function_table), NULL, zcallback, &retval, 2, args, 0, NULL TSRMLS_CC) != SUCCESS)
+    {
+        swoole_php_fatal_error(E_WARNING, "swoole_async_redis connect_callback handler error.");
+    }
+    if (EG(exception))
+    {
+        zend_exception_error(EG(exception), E_ERROR TSRMLS_CC);
+    }
+    if (retval != NULL)
+    {
+        sw_zval_ptr_dtor(&retval);
+    }
+    sw_zval_ptr_dtor(&result);
+    redis->connecting = 0;
+}
+
 void swoole_redis_init(int module_number TSRMLS_DC)
 {
-    INIT_CLASS_ENTRY(swoole_redis_ce, "swoole_redis", swoole_redis_methods);
+    SWOOLE_INIT_CLASS_ENTRY(swoole_redis_ce, "swoole_redis", "Swoole\\Redis", swoole_redis_methods);
     swoole_redis_class_entry_ptr = zend_register_internal_class(&swoole_redis_ce TSRMLS_CC);
+    SWOOLE_CLASS_ALIAS(swoole_redis, "Swoole\\Redis");
+
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("onConnect"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("onClose"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("onMessage"), ZEND_ACC_PUBLIC TSRMLS_CC);
+
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("setting"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("host"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("port"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("sock"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("errCode"), ZEND_ACC_PUBLIC TSRMLS_CC);
+    zend_declare_property_null(swoole_redis_class_entry_ptr, ZEND_STRL("errMsg"), ZEND_ACC_PUBLIC TSRMLS_CC);
+
+    zend_declare_class_constant_long(swoole_redis_class_entry_ptr, SW_STRL("STATE_CONNECT")-1, SWOOLE_REDIS_STATE_CONNECT TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_redis_class_entry_ptr, SW_STRL("STATE_READY")-1, SWOOLE_REDIS_STATE_READY TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_redis_class_entry_ptr, SW_STRL("STATE_WAIT_RESULT")-1, SWOOLE_REDIS_STATE_WAIT_RESULT TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_redis_class_entry_ptr, SW_STRL("STATE_SUBSCRIBE")-1, SWOOLE_REDIS_STATE_SUBSCRIBE TSRMLS_CC);
+    zend_declare_class_constant_long(swoole_redis_class_entry_ptr, SW_STRL("STATE_CLOSED")-1, SWOOLE_REDIS_STATE_CLOSED TSRMLS_CC);
+}
+
+static PHP_METHOD(swoole_redis, __construct)
+{
+    zval *zset = NULL;
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|z", &zset) == FAILURE)
+    {
+        return;
+    }
+
+    swRedisClient *redis = emalloc(sizeof(swRedisClient));
+    bzero(redis, sizeof(swRedisClient));
+
+    redis->object = getThis();
+    redis->timeout = SW_REDIS_CONNECT_TIMEOUT;
+    redis->database = -1;
+
+    if (zset && !ZVAL_IS_NULL(zset))
+    {
+        php_swoole_array_separate(zset);
+        zend_update_property(swoole_redis_class_entry_ptr, getThis(), ZEND_STRL("setting"), zset TSRMLS_CC);
+        sw_zval_ptr_dtor(&zset);
+
+        HashTable *vht;
+        zval *ztmp;
+        vht = Z_ARRVAL_P(zset);
+        /**
+         * timeout
+         */
+        if (php_swoole_array_get_value(vht, "timeout", ztmp))
+        {
+            convert_to_double(ztmp);
+            redis->timeout = (double) Z_DVAL_P(ztmp);
+        }
+        /**
+         * password
+         */
+        if (php_swoole_array_get_value(vht, "password", ztmp))
+        {
+            convert_to_string(ztmp);
+            if (Z_STRLEN_P(ztmp) >= 1 << 8)
+            {
+                swoole_php_fatal_error(E_WARNING, "redis password is too long.");
+            }
+            else if (Z_STRLEN_P(ztmp) > 0)
+            {
+                redis->password = estrdup(Z_STRVAL_P(ztmp));
+                redis->password_len = Z_STRLEN_P(ztmp);
+            }
+        }
+        /**
+         * database
+         */
+        if (php_swoole_array_get_value(vht, "database", ztmp))
+        {
+            convert_to_long(ztmp);
+            if (Z_LVAL_P(ztmp) > 1 << 8)
+            {
+                swoole_php_fatal_error(E_WARNING, "redis database number is too big.");
+            }
+            else
+            {
+                redis->database = (int8_t) Z_LVAL_P(ztmp);
+            }
+        }
+    }
+
+    sw_copy_to_stack(redis->object, redis->_object);
+    swoole_set_object(getThis(), redis);
+}
+
+static PHP_METHOD(swoole_redis, on)
+{
+    char *name;
+    zend_size_t len;
+    zval *cb;
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS()TSRMLS_CC, "sz", &name, &len, &cb) == FAILURE)
+    {
+        return;
+    }
+
+    swRedisClient *redis = swoole_get_object(getThis());
+    if (redis->context != NULL)
+    {
+        swoole_php_fatal_error(E_WARNING, "Must be called before connecting.");
+        RETURN_FALSE;
+    }
+
+    if (strncasecmp("close", name, len) == 0)
+    {
+        zend_update_property(swoole_redis_class_entry_ptr, getThis(), ZEND_STRL("onClose"), cb TSRMLS_CC);
+    }
+    else if (strncasecmp("message", name, len) == 0)
+    {
+        zend_update_property(swoole_redis_class_entry_ptr, getThis(), ZEND_STRL("onMessage"), cb TSRMLS_CC);
+        redis->message_callback = sw_zend_read_property(swoole_redis_class_entry_ptr, getThis(), ZEND_STRL("onMessage"), 0 TSRMLS_CC);
+        sw_copy_to_stack(redis->message_callback, redis->_message_callback);
+
+        redis->subscribe = 1;
+    }
+    else
+    {
+        swoole_php_error(E_WARNING, "Unknown event type[%s]", name);
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
 }
 
 static PHP_METHOD(swoole_redis, connect)
@@ -99,55 +318,46 @@ static PHP_METHOD(swoole_redis, connect)
 
     if (host_len <= 0)
     {
-        swoole_php_error(E_WARNING, "host is empty.");
+        swoole_php_error(E_WARNING, "redis server host is empty.");
         RETURN_FALSE;
     }
 
-    if (port <= 1 || port > 65535)
+    swRedisClient *redis = swoole_get_object(getThis());
+    redisAsyncContext *context;
+
+    if (strncasecmp(host, ZEND_STRL("unix:/")) == 0)
     {
-        swoole_php_error(E_WARNING, "port is invalid.");
-        RETURN_FALSE;
+        context = redisAsyncConnectUnix(host + 5);
+    }
+    else
+    {
+        if (port <= 1 || port > 65535)
+        {
+            swoole_php_error(E_WARNING, "redis server port is invalid.");
+            RETURN_FALSE;
+        }
+        context = redisAsyncConnect(host, (int) port);
     }
 
-    swRedisClient *redis = emalloc(sizeof(swRedisClient));
-    bzero(redis, sizeof(swRedisClient));
-
-#if PHP_MAJOR_VERSION < 7
-    redis->object = getThis();
-#else
-    redis->object = &redis->_object;
-    memcpy(redis->object, getThis(), sizeof(zval));
-#endif
-    sw_zval_add_ref(&redis->object);
-
-    swoole_set_object(getThis(), redis);
-
-    redisAsyncContext *context = redisAsyncConnect(host, (int) port);
     if (context->err)
     {
-        swoole_php_error(E_WARNING, "connect to redis-server[%s:%d] failed, Erorr: %s[%d]", host, (int) port, context->errstr, context->err);
+        swoole_php_error(E_WARNING, "failed to connect to the redis-server[%s:%d], Erorr: %s[%d]", host, (int) port, context->errstr, context->err);
         RETURN_FALSE;
     }
 
     php_swoole_check_reactor();
-    if (!isset_event_callback)
+    if (!swReactor_handle_isset(SwooleG.main_reactor, PHP_SWOOLE_FD_REDIS))
     {
         SwooleG.main_reactor->setHandle(SwooleG.main_reactor, PHP_SWOOLE_FD_REDIS | SW_EVENT_READ, swoole_redis_onRead);
         SwooleG.main_reactor->setHandle(SwooleG.main_reactor, PHP_SWOOLE_FD_REDIS | SW_EVENT_WRITE, swoole_redis_onWrite);
-        isset_event_callback = 1;
+        SwooleG.main_reactor->setHandle(SwooleG.main_reactor, PHP_SWOOLE_FD_REDIS | SW_EVENT_ERROR, swoole_redis_onError);
     }
 
     redisAsyncSetConnectCallback(context, swoole_redis_onConnect);
     redisAsyncSetDisconnectCallback(context, swoole_redis_onClose);
 
-#if PHP_MAJOR_VERSION < 7
-    redis->connect_callback = callback;
-#else
-    redis->connect_callback = &redis->_connect_callback;
-    memcpy(redis->connect_callback, callback, sizeof(zval));
-#endif
-
-    sw_zval_add_ref(&redis->connect_callback);
+    zend_update_property_long(swoole_redis_class_entry_ptr, getThis(), ZEND_STRL("sock"), context->c.fd TSRMLS_CC);
+    zend_update_property(swoole_redis_class_entry_ptr, getThis(), ZEND_STRL("onConnect"), callback TSRMLS_CC);
 
     redis->context = context;
     context->ev.addRead = swoole_redis_event_AddRead;
@@ -166,28 +376,62 @@ static PHP_METHOD(swoole_redis, connect)
         RETURN_FALSE;
     }
 
+    if (redis->timeout > 0)
+    {
+        php_swoole_check_timer((int) (redis->timeout * 1000));
+        redis->timer = SwooleG.timer.add(&SwooleG.timer, (int) (redis->timeout * 1000), 0, redis, swoole_redis_onTimeout);
+    }
+
+    sw_zval_add_ref(&redis->object);
+
     swConnection *conn = swReactor_get(SwooleG.main_reactor, redis->context->c.fd);
     conn->object = redis;
+}
+
+static void redis_close(void* data)
+{
+    swRedisClient *redis = data;
+    redisAsyncDisconnect(redis->context);
+}
+
+static void redis_free_object(void *data)
+{
+    zval *object = (zval*) data;
+    sw_zval_ptr_dtor(&object);
 }
 
 static PHP_METHOD(swoole_redis, close)
 {
     swRedisClient *redis = swoole_get_object(getThis());
-    redisAsyncDisconnect(redis->context);
+    if (redis && redis->context && redis->state != SWOOLE_REDIS_STATE_CLOSED)
+    {
+        if (redis->connecting)
+        {
+            SwooleG.main_reactor->defer(SwooleG.main_reactor, redis_close, redis);
+        }
+        else
+        {
+            redis_close(redis);
+        }
+    }
 }
 
 static PHP_METHOD(swoole_redis, __destruct)
 {
     swRedisClient *redis = swoole_get_object(getThis());
-    if (!redis)
+    if (redis)
     {
-        return;
+        if (redis->context && redis->state != SWOOLE_REDIS_STATE_CLOSED)
+        {
+            redisAsyncDisconnect(redis->context);
+        }
+        if (redis->password)
+        {
+            efree(redis->password);
+        }
+        efree(redis);
+        swoole_set_object(getThis(), NULL);
     }
-    if (redis->state != SWOOLE_REDIS_STATE_CLOSED)
-    {
-        redisAsyncDisconnect(redis->context);
-    }
-    efree(redis);
 }
 
 static PHP_METHOD(swoole_redis, __call)
@@ -201,16 +445,38 @@ static PHP_METHOD(swoole_redis, __call)
         return;
     }
 
+    if (Z_TYPE_P(params) != IS_ARRAY)
+    {
+        swoole_php_fatal_error(E_WARNING, "invalid params.");
+        RETURN_FALSE;
+    }
+
     swRedisClient *redis = swoole_get_object(getThis());
+    if (!redis)
+    {
+        swoole_php_fatal_error(E_WARNING, "the object is not an instance of swoole_redis.");
+        RETURN_FALSE;
+    }
+
     switch (redis->state)
     {
     case SWOOLE_REDIS_STATE_CONNECT:
         swoole_php_error(E_WARNING, "redis client is not connected.");
         RETURN_FALSE;
         break;
-    case SWOOLE_REDIS_STATE_WAIT:
-        swoole_php_error(E_WARNING, "redis client is waiting for response.");
-        RETURN_FALSE;
+    case SWOOLE_REDIS_STATE_WAIT_RESULT:
+        if (swoole_redis_is_message_command(command, command_len))
+        {
+            swoole_php_error(E_WARNING, "redis client is waiting for response.");
+            RETURN_FALSE;
+        }
+        break;
+    case SWOOLE_REDIS_STATE_SUBSCRIBE:
+        if (!swoole_redis_is_message_command(command, command_len))
+        {
+            swoole_php_error(E_WARNING, "redis client is waiting for subscribed messages.");
+            RETURN_FALSE;
+        }
         break;
     case SWOOLE_REDIS_STATE_CLOSED:
         swoole_php_error(E_WARNING, "redis client connection is closed.");
@@ -220,33 +486,7 @@ static PHP_METHOD(swoole_redis, __call)
         break;
     }
 
-#if PHP_MAJOR_VERSION < 7
-    zval *callback;
-    zval **cb_tmp;
-    if (zend_hash_index_find(Z_ARRVAL_P(params), zend_hash_num_elements(Z_ARRVAL_P(params)) - 1, (void **) &cb_tmp) == FAILURE)
-    {
-        swoole_php_error(E_WARNING, "index out of array.");
-        RETURN_FALSE;
-    }
-    callback = *cb_tmp;
-    redis->result_callback = callback;
-#else
-    zval *callback = zend_hash_index_find(Z_ARRVAL_P(params), zend_hash_num_elements(Z_ARRVAL_P(params)) - 1);
-    if (callback == NULL)
-    {
-        swoole_php_error(E_WARNING, "index out of array.");
-        RETURN_FALSE;
-    }
-    redis->result_callback = &redis->_result_callback;
-    memcpy(redis->result_callback, callback, sizeof(zval));
-#endif
-
-    sw_zval_add_ref(&redis->result_callback);
-
-    redis->state = SWOOLE_REDIS_STATE_WAIT;
-
     int argc = zend_hash_num_elements(Z_ARRVAL_P(params));
-
     size_t stack_argvlen[SW_REDIS_COMMAND_BUFFER_SIZE];
     char *stack_argv[SW_REDIS_COMMAND_BUFFER_SIZE];
 
@@ -265,6 +505,23 @@ static PHP_METHOD(swoole_redis, __call)
         argvlen = stack_argvlen;
         argv = stack_argv;
     }
+#define FREE_MEM() do {                 \
+    for (i = 1; i < argc; i++)          \
+    {                                   \
+        efree((void* )argv[i]);         \
+    }                                   \
+                                        \
+    if (redis->state == SWOOLE_REDIS_STATE_SUBSCRIBE) \
+    {                                   \
+        efree(argv[argc]);              \
+    }                                   \
+                                        \
+    if (free_mm)                        \
+    {                                   \
+        efree(argvlen);                 \
+        efree(argv);                    \
+    }                                   \
+} while (0)
 
     assert(command_len < SW_REDIS_COMMAND_KEY_SIZE - 1);
 
@@ -278,36 +535,107 @@ static PHP_METHOD(swoole_redis, __call)
     zval *value;
     int i = 1;
 
-    SW_HASHTABLE_FOREACH_START(Z_ARRVAL_P(params), value)
-        convert_to_string(value);
-        argvlen[i] = (size_t) Z_STRLEN_P(value);
-        argv[i] = estrndup(Z_STRVAL_P(value), Z_STRLEN_P(value));
-        if (i == argc - 1)
-        {
-            break;
-        }
-        i++;
-    SW_HASHTABLE_FOREACH_END();
-
-    if (redisAsyncCommandArgv(redis->context, swoole_redis_onResult, NULL, argc, (const char **) argv, (const size_t *) argvlen) < 0)
+    /**
+     * subscribe command
+     */
+    if (redis->state == SWOOLE_REDIS_STATE_SUBSCRIBE || (redis->subscribe && swoole_redis_is_message_command(command, command_len)))
     {
-        swoole_php_error(E_WARNING, "redisAsyncCommandArgv() failed.");
+        redis->state = SWOOLE_REDIS_STATE_SUBSCRIBE;
+
+        SW_HASHTABLE_FOREACH_START(Z_ARRVAL_P(params), value)
+            convert_to_string(value);
+            argvlen[i] = (size_t) Z_STRLEN_P(value);
+            argv[i] = estrndup(Z_STRVAL_P(value), Z_STRLEN_P(value));
+            if (i == argc)
+            {
+                break;
+            }
+            i++;
+        SW_HASHTABLE_FOREACH_END();
+
+        if (redisAsyncCommandArgv(redis->context, swoole_redis_onResult, NULL, argc + 1, (const char **) argv, (const size_t *) argvlen) < 0)
+        {
+            swoole_php_error(E_WARNING, "redisAsyncCommandArgv() failed.");
+            FREE_MEM();
+            RETURN_FALSE;
+        }
+    }
+    /**
+     * storage command
+     */
+    else
+    {
+        redis->state = SWOOLE_REDIS_STATE_WAIT_RESULT;
+        redis->reqnum++;
+
+#if PHP_MAJOR_VERSION < 7
+        zval *callback;
+        zval **cb_tmp;
+        if (zend_hash_index_find(Z_ARRVAL_P(params), zend_hash_num_elements(Z_ARRVAL_P(params)) - 1, (void **) &cb_tmp) == FAILURE)
+        {
+            swoole_php_error(E_WARNING, "index out of array bounds.");
+            FREE_MEM();
+            RETURN_FALSE;
+        }
+        callback = *cb_tmp;
+#else
+        zval *callback = zend_hash_index_find(Z_ARRVAL_P(params), zend_hash_num_elements(Z_ARRVAL_P(params)) - 1);
+        if (callback == NULL)
+        {
+            swoole_php_error(E_WARNING, "index out of array bounds.");
+            FREE_MEM();
+            RETURN_FALSE;
+        }
+#endif
+
+        sw_zval_add_ref(&callback);
+        callback = sw_zval_dup(callback);
+
+        SW_HASHTABLE_FOREACH_START(Z_ARRVAL_P(params), value)
+            if (i == argc)
+            {
+                break;
+            }
+
+            convert_to_string(value);
+            argvlen[i] = (size_t) Z_STRLEN_P(value);
+            argv[i] = estrndup(Z_STRVAL_P(value), Z_STRLEN_P(value));
+            i++;
+        SW_HASHTABLE_FOREACH_END();
+
+        if (redisAsyncCommandArgv(redis->context, swoole_redis_onResult, callback, argc, (const char **) argv, (const size_t *) argvlen) < 0)
+        {
+            swoole_php_error(E_WARNING, "redisAsyncCommandArgv() failed.");
+            FREE_MEM();
+            RETURN_FALSE;
+        }
+    }
+
+    FREE_MEM();
+    RETURN_TRUE;
+}
+
+static PHP_METHOD(swoole_redis, getState)
+{
+    swRedisClient *redis = swoole_get_object(getThis());
+    if (!redis)
+    {
+        swoole_php_fatal_error(E_WARNING, "object is not instanceof swoole_redis.");
         RETURN_FALSE;
     }
+    RETURN_LONG(redis->state);
+}
 
-    for (i = 1; i < argc; i++)
-    {
-        efree((void* )argv[i]);
-    }
+static void swoole_redis_set_error(swRedisClient *redis, zval* return_value, redisReply* reply TSRMLS_DC)
+{
+    char *str = malloc(reply->len + 1);
+    memcpy(str, reply->str, reply->len);
+    str[reply->len] = 0;
 
-    if (free_mm)
-    {
-        efree(argvlen);
-        efree(argv);
-    }
-
-    redis->state = SWOOLE_REDIS_STATE_WAIT;
-    RETURN_TRUE;
+    ZVAL_FALSE(return_value);
+    zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"), -1 TSRMLS_CC);
+    zend_update_property_string(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errMsg"), str TSRMLS_CC);
+    free(str);
 }
 
 static void swoole_redis_parse_result(swRedisClient *redis, zval* return_value, redisReply* reply TSRMLS_DC)
@@ -328,15 +656,20 @@ static void swoole_redis_parse_result(swRedisClient *redis, zval* return_value, 
         break;
 
     case REDIS_REPLY_ERROR:
-        ZVAL_FALSE(return_value);
-        zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"), redis->context->err TSRMLS_CC);
-        zend_update_property_string(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errMsg"), redis->context->errstr TSRMLS_CC);
+        swoole_redis_set_error(redis, return_value, reply TSRMLS_CC);
         break;
 
     case REDIS_REPLY_STATUS:
         if (redis->context->err == 0)
         {
-            ZVAL_TRUE(return_value);
+            if (reply->len > 0)
+            {
+                SW_ZVAL_STRINGL(return_value, reply->str, reply->len, 1);
+            }
+            else
+            {
+                ZVAL_TRUE(return_value);
+            }
         }
         else
         {
@@ -368,6 +701,84 @@ static void swoole_redis_parse_result(swRedisClient *redis, zval* return_value, 
     }
 }
 
+static void swoole_redis_onTimeout(swTimer *timer, swTimer_node *tnode)
+{
+#if PHP_MAJOR_VERSION < 7
+    TSRMLS_FETCH_FROM_CTX(sw_thread_ctx ? sw_thread_ctx : NULL);
+#endif
+    swRedisClient *redis = tnode->data;
+    zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"), ETIMEDOUT TSRMLS_CC);
+    zend_update_property_string(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errMsg"), strerror(ETIMEDOUT) TSRMLS_CC);
+    redis->state = SWOOLE_REDIS_STATE_CLOSED;
+    redis_execute_connect_callback(redis, 0 TSRMLS_CC);
+    redisAsyncDisconnect(redis->context);
+    sw_zval_ptr_dtor(&redis->object);
+}
+
+static void swoole_redis_onCompleted(redisAsyncContext *c, void *r, void *privdata)
+{
+#if PHP_MAJOR_VERSION < 7
+    TSRMLS_FETCH_FROM_CTX(sw_thread_ctx ? sw_thread_ctx : NULL);
+#endif
+
+    swRedisClient *redis = c->ev.data;
+    if (redis->state == SWOOLE_REDIS_STATE_CLOSED)
+    {
+        return;
+    }
+
+    if (redis->failure == 0)
+    {
+        redisReply *reply = r;
+        switch (reply->type)
+        {
+        case REDIS_REPLY_ERROR:
+            zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"), 0 TSRMLS_CC);
+            zend_update_property_stringl(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errMsg"), reply->str,
+                    reply->len TSRMLS_CC);
+            redis->failure = 1;
+            break;
+
+        case REDIS_REPLY_STATUS:
+            if (redis->context->err == 0)
+            {
+                break;
+            }
+            else
+            {
+                zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"),
+                        redis->context->err TSRMLS_CC);
+                zend_update_property_string(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errMsg"),
+                        redis->context->errstr TSRMLS_CC);
+                redis->failure = 1;
+            }
+            break;
+        }
+    }
+
+    redis->wait_count--;
+    if (redis->wait_count == 0)
+    {
+        if (redis->failure)
+        {
+            redis_execute_connect_callback(redis, 0 TSRMLS_CC);
+            redis->connecting = 0;
+            zval *retval = NULL;
+            zval *zobject = redis->object;
+            sw_zend_call_method_with_0_params(&zobject, swoole_redis_class_entry_ptr, NULL, "close", &retval);
+            if (retval)
+            {
+                sw_zval_ptr_dtor(&retval);
+            }
+            return;
+        }
+        else
+        {
+            redis_execute_connect_callback(redis, 1 TSRMLS_CC);
+        }
+    }
+}
+
 static void swoole_redis_onResult(redisAsyncContext *c, void *r, void *privdata)
 {
 #if PHP_MAJOR_VERSION < 7
@@ -380,22 +791,39 @@ static void swoole_redis_onResult(redisAsyncContext *c, void *r, void *privdata)
         return;
     }
 
+    zend_bool is_subscribe = 0;
+    char *callback_type;
     swRedisClient *redis = c->ev.data;
-    zval *result, *retval;
+    zval *result, *retval, *callback;
     SW_MAKE_STD_ZVAL(result);
 
     swoole_redis_parse_result(redis, result, reply TSRMLS_CC);
 
-    redis->state = SWOOLE_REDIS_STATE_READY;
+    if (redis->state == SWOOLE_REDIS_STATE_SUBSCRIBE)
+    {
+        callback = redis->message_callback;
+        callback_type = "Message";
+        is_subscribe = 1;
+    }
+    else
+    {
+        callback = (zval *)privdata;
+        callback_type = "Result";
+        assert(redis->reqnum > 0 && redis->state == SWOOLE_REDIS_STATE_WAIT_RESULT);
+        redis->reqnum--;
+        if (redis->reqnum == 0)
+        {
+            redis->state = SWOOLE_REDIS_STATE_READY;
+        }
+    }
 
     zval **args[2];
     args[0] = &redis->object;
     args[1] = &result;
-    zval *callback = redis->result_callback;
 
     if (sw_call_user_function_ex(EG(function_table), NULL, callback, &retval, 2, args, 0, NULL TSRMLS_CC) != SUCCESS)
     {
-        swoole_php_fatal_error(E_WARNING, "swoole_async_mysql callback handler error.");
+        swoole_php_fatal_error(E_WARNING, "swoole_redis callback[%s] handler error.", callback_type);
     }
     if (EG(exception))
     {
@@ -406,9 +834,10 @@ static void swoole_redis_onResult(redisAsyncContext *c, void *r, void *privdata)
         sw_zval_ptr_dtor(&retval);
     }
     sw_zval_ptr_dtor(&result);
-#if PHP_MAJOR_VERSION < 7
-    sw_zval_ptr_dtor(&callback);
-#endif
+    if (!is_subscribe)
+    {
+        sw_zval_free(callback);
+    }
 }
 
 void swoole_redis_onConnect(const redisAsyncContext *c, int status)
@@ -418,83 +847,188 @@ void swoole_redis_onConnect(const redisAsyncContext *c, int status)
 #endif
     swRedisClient *redis = c->ev.data;
 
-    zval *result, *retval;
-    SW_MAKE_STD_ZVAL(result);
+    if (redis->timer)
+    {
+        swTimer_del(&SwooleG.timer, redis->timer);
+        redis->timer = NULL;
+    }
+
     if (status != REDIS_OK)
     {
-        ZVAL_BOOL(result, 0);
-        zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"), c->err TSRMLS_CC);
+        zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"), errno TSRMLS_CC);
         zend_update_property_string(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errMsg"), c->errstr TSRMLS_CC);
         redis->state = SWOOLE_REDIS_STATE_CLOSED;
+        redis_execute_connect_callback(redis, 0 TSRMLS_CC);
+        SwooleG.main_reactor->defer(SwooleG.main_reactor, redis_free_object, redis->object);
+        return;
     }
     else
     {
-        ZVAL_BOOL(result, 1);
         redis->state = SWOOLE_REDIS_STATE_READY;
+        redis->connected = 1;
     }
 
-    zval **args[2];
-    args[0] = &redis->object;
-    args[1] = &result;
-
-    if (sw_call_user_function_ex(EG(function_table), NULL, redis->connect_callback, &retval, 2, args, 0, NULL TSRMLS_CC) != SUCCESS)
+    if (redis->password)
     {
-        swoole_php_fatal_error(E_WARNING, "swoole_async_mysql callback handler error.");
+        redisAsyncCommand((redisAsyncContext *) c, swoole_redis_onCompleted, NULL, "AUTH %b", redis->password, redis->password_len);
+        redis->wait_count++;
     }
-    if (retval != NULL)
+    if (redis->database >= 0)
     {
-        sw_zval_ptr_dtor(&retval);
+        redisAsyncCommand((redisAsyncContext *) c, swoole_redis_onCompleted, (char*) "end-1", "SELECT %d", redis->database);
+        redis->wait_count++;
     }
-    sw_zval_ptr_dtor(&result);
+    if (redis->wait_count == 0)
+    {
+        redis_execute_connect_callback(redis, 1 TSRMLS_CC);
+    }
 }
 
 void swoole_redis_onClose(const redisAsyncContext *c, int status)
 {
     swRedisClient *redis = c->ev.data;
     redis->state = SWOOLE_REDIS_STATE_CLOSED;
+
+#if PHP_MAJOR_VERSION < 7
+        TSRMLS_FETCH_FROM_CTX(sw_thread_ctx ? sw_thread_ctx : NULL);
+#endif
+
+    zval *zcallback = sw_zend_read_property(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("onClose"), 1 TSRMLS_CC);
+    if (zcallback && !ZVAL_IS_NULL(zcallback))
+    {
+        zval *retval;
+        zval **args[1];
+        args[0] = &redis->object;
+        if (sw_call_user_function_ex(EG(function_table), NULL, zcallback, &retval, 1, args, 0, NULL TSRMLS_CC) != SUCCESS)
+        {
+            swoole_php_fatal_error(E_WARNING, "swoole_async_redis close_callback handler error.");
+        }
+        if (EG(exception))
+        {
+            zend_exception_error(EG(exception), E_ERROR TSRMLS_CC);
+        }
+        if (retval != NULL)
+        {
+            sw_zval_ptr_dtor(&retval);
+        }
+    }
+    redis->context = NULL;
+    sw_zval_ptr_dtor(&redis->object);
+}
+
+static int swoole_redis_onError(swReactor *reactor, swEvent *event)
+{
+#if PHP_MAJOR_VERSION < 7
+        TSRMLS_FETCH_FROM_CTX(sw_thread_ctx ? sw_thread_ctx : NULL);
+#endif
+    swRedisClient *redis = event->socket->object;
+    zval *zcallback = sw_zend_read_property(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("onConnect"), 0 TSRMLS_CC);
+
+    if (!ZVAL_IS_NULL(zcallback))
+    {
+        const redisAsyncContext *c = redis->context;
+        zval *result;
+        SW_MAKE_STD_ZVAL(result);
+        ZVAL_BOOL(result, 0);
+        zend_update_property_long(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errCode"), c->err TSRMLS_CC);
+        zend_update_property_string(swoole_redis_class_entry_ptr, redis->object, ZEND_STRL("errMsg"), c->errstr TSRMLS_CC);
+
+        redis->state = SWOOLE_REDIS_STATE_CLOSED;
+
+        zval *retval = NULL;
+        zval **args[2];
+        args[0] = &redis->object;
+        args[1] = &result;
+        redis->connecting = 1;
+        if (sw_call_user_function_ex(EG(function_table), NULL, zcallback, &retval, 2, args, 0, NULL TSRMLS_CC) != SUCCESS)
+        {
+            swoole_php_fatal_error(E_WARNING, "swoole_async_redis connect_callback handler error.");
+        }
+        if (EG(exception))
+        {
+            zend_exception_error(EG(exception), E_ERROR TSRMLS_CC);
+        }
+        if (retval != NULL)
+        {
+            sw_zval_ptr_dtor(&retval);
+        }
+        sw_zval_ptr_dtor(&result);
+
+        redis->connecting = 0;
+        retval = NULL;
+        zval *zobject = redis->object;
+        sw_zend_call_method_with_0_params(&zobject, swoole_redis_class_entry_ptr, NULL, "close", &retval);
+        if (retval)
+        {
+            sw_zval_ptr_dtor(&retval);
+        }
+    }
+    return SW_OK;
 }
 
 static void swoole_redis_event_AddRead(void *privdata)
 {
     swRedisClient *redis = (swRedisClient*) privdata;
-    swReactor_add_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_READ);
+    if (redis->context && SwooleG.main_reactor)
+    {
+        swReactor_add_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_READ);
+    }
 }
 
 static void swoole_redis_event_DelRead(void *privdata)
 {
     swRedisClient *redis = (swRedisClient*) privdata;
-    swReactor_del_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_READ);
+    if (redis->context && SwooleG.main_reactor)
+    {
+        swReactor_del_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_READ);
+    }
 }
 
 static void swoole_redis_event_AddWrite(void *privdata)
 {
     swRedisClient *redis = (swRedisClient*) privdata;
-    swReactor_add_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_WRITE);
+    if (redis->context && SwooleG.main_reactor)
+    {
+        swReactor_add_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_WRITE);
+    }
 }
 
 static void swoole_redis_event_DelWrite(void *privdata)
 {
     swRedisClient *redis = (swRedisClient*) privdata;
-    swReactor_del_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_WRITE);
+    if (redis->context && SwooleG.main_reactor)
+    {
+        swReactor_del_event(SwooleG.main_reactor, redis->context->c.fd, SW_EVENT_WRITE);
+    }
 }
 
 static void swoole_redis_event_Cleanup(void *privdata)
 {
     swRedisClient *redis = (swRedisClient*) privdata;
-    SwooleG.main_reactor->del(SwooleG.main_reactor, redis->context->c.fd);
+    redis->state = SWOOLE_REDIS_STATE_CLOSED;
+    if (redis->context && SwooleG.main_reactor)
+    {
+        SwooleG.main_reactor->del(SwooleG.main_reactor, redis->context->c.fd);
+    }
 }
 
 static int swoole_redis_onRead(swReactor *reactor, swEvent *event)
 {
     swRedisClient *redis = event->socket->object;
-    redisAsyncHandleRead(redis->context);
+    if (redis->context && SwooleG.main_reactor)
+    {
+        redisAsyncHandleRead(redis->context);
+    }
     return SW_OK;
 }
 
 static int swoole_redis_onWrite(swReactor *reactor, swEvent *event)
 {
     swRedisClient *redis = event->socket->object;
-    redisAsyncHandleWrite(redis->context);
+    if (redis->context && SwooleG.main_reactor)
+    {
+        redisAsyncHandleWrite(redis->context);
+    }
     return SW_OK;
 }
 

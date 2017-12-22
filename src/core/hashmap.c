@@ -115,6 +115,7 @@ swHashMap* swHashMap_new(uint32_t bucket_num, swHashMap_dtor dtor)
     if (!(root->hh.tbl))
     {
         swWarn("malloc for table failed.");
+        sw_free(hmap);
         return NULL;
     }
 
@@ -127,6 +128,7 @@ swHashMap* swHashMap_new(uint32_t bucket_num, swHashMap_dtor dtor)
     if (!root->hh.tbl->buckets)
     {
         swWarn("malloc for buckets failed.");
+        sw_free(hmap);
         return NULL;
     }
     memset(root->hh.tbl->buckets, 0, SW_HASHMAP_INIT_BUCKET_N * sizeof(struct UT_hash_bucket));
@@ -147,7 +149,7 @@ int swHashMap_add(swHashMap* hmap, char *key, uint16_t key_len, void *data)
     }
     bzero(node, sizeof(swHashMap_node));
     swHashMap_node *root = hmap->root;
-    node->key_str = strndup(key, key_len);
+    node->key_str = sw_strndup(key, key_len);
     node->key_int = key_len;
     node->data = data;
     return swHashMap_node_add(root, node);
@@ -295,6 +297,39 @@ int swHashMap_del_int(swHashMap *hmap, uint64_t key)
     return SW_OK;
 }
 
+int swHashMap_move(swHashMap *hmap, char *old_key, uint16_t old_key_len, char *new_key, uint16_t new_key_len)
+{
+    swHashMap_node *root = hmap->root;
+    swHashMap_node *node = swHashMap_node_find(root, old_key, old_key_len);
+    if (node == NULL)
+    {
+        return SW_ERR;
+    }
+    swHashMap_node_delete(root, node);
+    sw_free(node->key_str);
+    node->key_str = sw_strndup(new_key, new_key_len);
+    node->key_int = new_key_len;
+    return swHashMap_node_add(root, node);
+}
+
+int swHashMap_move_int(swHashMap *hmap, uint64_t old_key, uint64_t new_key)
+{
+    swHashMap_node *ret = NULL;
+    swHashMap_node *root = hmap->root;
+
+    HASH_FIND_INT(root, &old_key, ret);
+    if (ret == NULL)
+    {
+        return SW_ERR;
+    }
+    HASH_DEL(root, ret);
+
+    ret->key_int = new_key;
+    HASH_ADD_INT(root, key_int, ret);
+
+    return SW_OK;
+}
+
 void* swHashMap_each(swHashMap* hmap, char **key)
 {
     swHashMap_node *node = swHashMap_node_each(hmap);
@@ -321,6 +356,15 @@ void* swHashMap_each_int(swHashMap* hmap, uint64_t *key)
     {
         return NULL;
     }
+}
+
+uint32_t swHashMap_count(swHashMap* hmap)
+{
+    if (hmap == NULL)
+    {
+        return 0;
+    }
+    return HASH_COUNT(hmap->root);
 }
 
 void swHashMap_free(swHashMap* hmap)

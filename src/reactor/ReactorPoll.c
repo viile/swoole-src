@@ -15,7 +15,7 @@
 */
 
 #include "swoole.h"
-#include <sys/poll.h>
+#include <poll.h>
 
 static int swReactorPoll_add(swReactor *reactor, int fd, int fdtype);
 static int swReactorPoll_set(swReactor *reactor, int fd, int fdtype);
@@ -51,12 +51,14 @@ int swReactorPoll_create(swReactor *reactor, int max_fd_num)
     if (object->fds == NULL)
     {
         swWarn("malloc[1] failed");
+        sw_free(object);
         return SW_ERR;
     }
     object->events = sw_calloc(max_fd_num, sizeof(struct pollfd));
     if (object->events == NULL)
     {
         swWarn("malloc[2] failed");
+        sw_free(object);
         return SW_ERR;
     }
     object->max_fd_num = max_fd_num;
@@ -88,11 +90,6 @@ static int swReactorPoll_add(swReactor *reactor, int fd, int fdtype)
         return SW_ERR;
     }
 
-    if (swReactor_add(reactor, fd, fdtype) < 0)
-    {
-        return SW_ERR;
-    }
-
     swReactorPoll *object = reactor->object;
     int cur = reactor->event_num;
     if (reactor->event_num == object->max_fd_num)
@@ -100,6 +97,8 @@ static int swReactorPoll_add(swReactor *reactor, int fd, int fdtype)
         swWarn("too many connection, more than %d", object->max_fd_num);
         return SW_ERR;
     }
+
+    swReactor_add(reactor, fd, fdtype);
 
     swTrace("fd=%d, fdtype=%d", fd, fdtype);
 
@@ -119,6 +118,7 @@ static int swReactorPoll_add(swReactor *reactor, int fd, int fdtype)
     {
         object->events[cur].events |= POLLHUP;
     }
+
     reactor->event_num++;
     return SW_OK;
 }
@@ -159,16 +159,8 @@ static int swReactorPoll_del(swReactor *reactor, int fd)
     uint32_t i;
     swReactorPoll *object = reactor->object;
 
-    swTrace("fd=%d", fd);
-
-    if (swReactor_del(reactor, fd) < 0)
-    {
-        return SW_ERR;
-    }
-
     for (i = 0; i < reactor->event_num; i++)
     {
-        //找到了
         if (object->events[i].fd == fd)
         {
             uint32_t old_num = reactor->event_num;
@@ -187,6 +179,7 @@ static int swReactorPoll_del(swReactor *reactor, int fd)
                     object->events[i] = object->events[i + 1];
                 }
             }
+            swReactor_del(reactor, fd);
             return SW_OK;
         }
     }
@@ -212,6 +205,8 @@ static int swReactorPoll_wait(swReactor *reactor, struct timeval *timeo)
             reactor->timeout_msec = timeo->tv_sec * 1000 + timeo->tv_usec / 1000;
         }
     }
+
+    reactor->start = 1;
 
     while (reactor->running > 0)
     {
@@ -244,7 +239,7 @@ static int swReactorPoll_wait(swReactor *reactor, struct timeval *timeo)
 
                 swTrace("Event: fd=%d|from_id=%d|type=%d", event.fd, reactor->id, object->fds[i].fdtype);
                 //in
-                if (object->events[i].revents & POLLIN)
+                if ((object->events[i].revents & POLLIN) && !event.socket->removed)
                 {
                     handle = swReactor_getHandle(reactor, SW_EVENT_READ, event.type);
                     ret = handle(reactor, &event);
@@ -266,6 +261,11 @@ static int swReactorPoll_wait(swReactor *reactor, struct timeval *timeo)
                 //error
                 if ((object->events[i].revents & (POLLHUP | POLLERR)) && !event.socket->removed)
                 {
+                    //ignore ERR and HUP, because event is already processed at IN and OUT handler.
+                    if ((object->events[i].revents & POLLIN) || (object->events[i].revents & POLLOUT))
+                    {
+                        continue;
+                    }
                     handle = swReactor_getHandle(reactor, SW_EVENT_ERROR, event.type);
                     ret = handle(reactor, &event);
                     if (ret < 0)
